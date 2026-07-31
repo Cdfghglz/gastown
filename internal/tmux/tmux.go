@@ -2232,6 +2232,133 @@ func (t *Tmux) CheckSessionHealth(session string, maxInactivity time.Duration) Z
 	return SessionHealthy
 }
 
+// SessionInputStatus describes the unsubmitted input state of a session.
+// This is the detection mechanism for hq-10r00 (Enter-submission race fix).
+type SessionInputStatus struct {
+	Session   string        // Session name
+	HasInput  bool          // true if pane shows unsubmitted input after the prompt
+	InputText string        // The text detected in the input line (for diagnostics)
+	Age       time.Duration // How long the input has been sitting (estimation based on pane activity)
+}
+
+// CheckSessionInput detects whether a single session has unsubmitted input.
+// Returns a SessionInputStatus describing the state and the detected input (if any).
+// Uses pane content capture and string comparison — no tmux format variables.
+//
+// Detection strategy:
+// 1. Capture the last 5 lines of pane content
+// 2. Look at the prompt line (typically the last line in a shell/agent pane)
+// 3. Check if there's text after the prompt that hasn't been submitted
+//
+// This is the key detection mechanism for hq-10r00. A nudge/notification that gets
+// stuck in the input buffer will appear as unsubmitted text after the prompt, sitting
+// there indefinitely. This function detects that state.
+//
+// NOTE: This uses capture-pane -p and string matching. The pre-rejected attempt 1
+// tried to use the non-existent tmux format variable #{pane_input_length}, which was
+// inverted (always returned success). This implementation uses the only reliable method
+// that works: capture the actual pane output and string-compare.
+func (t *Tmux) CheckSessionInput(session string) (SessionInputStatus, error) {
+	status := SessionInputStatus{Session: session}
+
+	// Capture the last 10 lines to get the prompt and any input
+	content, err := t.CapturePane(session, 10)
+	if err != nil {
+		return status, fmt.Errorf("capturing pane: %w", err)
+	}
+
+	if content == "" {
+		return status, nil
+	}
+
+	lines := strings.Split(content, "\n")
+	if len(lines) == 0 {
+		return status, nil
+	}
+
+	// Find the last non-empty line (should be the prompt/input line)
+	var lastLine string
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) != "" {
+			lastLine = lines[i]
+			break
+		}
+	}
+
+	if lastLine == "" {
+		return status, nil
+	}
+
+	// Parse the line to detect unsubmitted input.
+	// Expected patterns (depending on shell/agent):
+	//   "$ " (shell prompt, empty input)
+	//   "$ pending text" (shell with unsubmitted input)
+	//   "❯ " (Claude prompt, empty input)
+	//   "❯ pending text" (Claude with unsubmitted input)
+	//   "> " (generic prompt)
+	// The key is: if there's text AFTER the prompt character + space, it's unsubmitted.
+
+	status.InputText = lastLine
+
+	// Check for prompt indicators followed by additional text
+	// Look for common prompt patterns: "$ ", "# ", "> ", "% ", "❯ "
+	promptPatterns := []string{"$ ", "# ", "> ", "% ", "❯ ", "# ", "$$ "}
+	for _, pattern := range promptPatterns {
+		if idx := strings.Index(lastLine, pattern); idx >= 0 {
+			// Found a prompt — check if there's text after it
+			afterPrompt := lastLine[idx+len(pattern):]
+			if trimmed := strings.TrimSpace(afterPrompt); trimmed != "" {
+				status.HasInput = true
+				status.InputText = trimmed
+				return status, nil
+			}
+			// Prompt with nothing after it = clean state
+			return status, nil
+		}
+	}
+
+	// No recognizable prompt found, but line is non-empty.
+	// This might be input without a visible prompt, or output text.
+	// Be conservative: if the line doesn't end with typical output patterns,
+	// consider it potential input.
+	trimmed := strings.TrimSpace(lastLine)
+	if !strings.Contains(trimmed, "⏵⏵") && // Claude status bar
+		!strings.Contains(trimmed, "esc to interrupt") && // Claude busy indicator
+		!strings.Contains(trimmed, "⏵⏵") && // Unicode variant
+		len(trimmed) > 0 {
+		// Unrecognized non-empty line might be input
+		status.HasInput = true
+		status.InputText = trimmed
+	}
+
+	return status, nil
+}
+
+// CheckAllSessionsInput scans all tmux sessions and returns any that have
+// unsubmitted input sitting in their pane buffers.
+// This is the higher-level detection for the deacon monitoring layer.
+// Returns a slice of SessionInputStatus for sessions with HasInput == true.
+func (t *Tmux) CheckAllSessionsInput() ([]SessionInputStatus, error) {
+	sessions, err := t.ListSessions()
+	if err != nil {
+		return nil, fmt.Errorf("listing sessions: %w", err)
+	}
+
+	var results []SessionInputStatus
+	for _, session := range sessions {
+		status, err := t.CheckSessionInput(session)
+		if err != nil {
+			// Log but continue — one session's capture failure shouldn't block others
+			continue
+		}
+		if status.HasInput {
+			results = append(results, status)
+		}
+	}
+
+	return results, nil
+}
+
 // processMatchesNames checks if a process's binary name matches any of the given names.
 // Uses ps to get the actual command name from the process's executable path.
 // This handles cases where argv[0] is modified (e.g., Claude showing version "2.1.30").

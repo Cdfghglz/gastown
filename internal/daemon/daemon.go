@@ -1507,8 +1507,26 @@ func (d *Daemon) checkDeaconHeartbeat() {
 		}
 
 		d.logger.Printf("Deacon stuck for %s - nudging session", age.Round(time.Minute))
-		if err := d.tmux.NudgeSession(sessionName, "HEALTH_CHECK: heartbeat stale, respond to confirm responsiveness"); err != nil {
+		nudgeMsg := "HEALTH_CHECK: heartbeat stale, respond to confirm responsiveness"
+		if err := d.tmux.NudgeSession(sessionName, nudgeMsg); err != nil {
 			d.logger.Printf("Error nudging stuck Deacon: %v", err)
+			// Nudge send failed — likely session is dead, will be caught by next health check
+			return
+		}
+
+		// Verify nudge actually landed (hq-10r00: detect Enter-submission race)
+		// If the nudge text is stuck in the input buffer (Enter didn't land),
+		// that's the exact bug described in hq-10r00. Detect it and alert.
+		time.Sleep(500 * time.Millisecond) // Give tmux time to process the nudge
+		inputStatus, err := d.tmux.CheckSessionInput(sessionName)
+		if err == nil && inputStatus.HasInput {
+			// Nudge text is stuck in the input buffer — Enter didn't land.
+			// This is the hq-10r00 race condition in action.
+			d.logger.Printf("ALERT: Deacon nudge stuck in input buffer (hq-10r00 race detected): %q", inputStatus.InputText)
+			d.notifySlack("admin", "high",
+				fmt.Sprintf("Deacon nudge failed to submit (Enter-submission race, hq-10r00): %q",
+					inputStatus.InputText))
+			// Don't restart yet — alert first, let the operator decide
 		}
 	}
 }
