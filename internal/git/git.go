@@ -1524,7 +1524,18 @@ func (g *Git) WorktreeAddExisting(path, branch string) error {
 }
 
 // WorktreeAddExistingForce creates a new worktree even if the branch is already checked out elsewhere.
-// This is useful for cross-rig worktrees where multiple clones need to be on main.
+//
+// DANGEROUS -- ri-500s. `git worktree add --force` bypasses git's refusal to
+// check the same branch out twice in one gitdir, and that refusal is load
+// bearing. Worktrees sharing refs/heads/main see main advance when ANY of them
+// commits, while their own index and working tree stay put; `git status` then
+// reports the difference as a staged REVERT of the new commits, with no author.
+// Anyone who "preserves" that state re-lands the revert.
+//
+// ONLY use this for a worktree that is transient AND serialized under a lock,
+// so no second commit can land while it holds the branch (see the merge-queue
+// land worktree in internal/cmd/mq_integration.go). For any long-lived worktree
+// -- crew, mayor, polecat -- give it its own branch via WorktreeAddFromRef.
 func (g *Git) WorktreeAddExistingForce(path, branch string) error {
 	if _, err := g.run("worktree", "add", "--force", path, branch); err != nil {
 		return err
