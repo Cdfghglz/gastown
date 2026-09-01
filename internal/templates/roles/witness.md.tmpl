@@ -229,6 +229,40 @@ Process mail in your inbox-check mol step.
 
 ---
 
+## ⛔ Before You Call a Polecat STALLED — Verify by Artifact
+
+**`HOOKED` + no MR + N minutes is NOT evidence of a stalled session.** It is equally
+the signature of a polecat that **finished, deferred, and hit the hook-clearance bug**
+(`gt done` executes but the bead stays HOOKED). Those two states are indistinguishable
+from status alone, and the remedies are opposites: one needs a data fix, the other a
+lifecycle action that **destroys a live worktree**.
+
+**Run all four checks before escalating a lifecycle action. Quote them in the escalation.**
+
+```bash
+tmux capture-pane -p -t <session> | tail -20      # a completion message = it finished
+git -C <polecat worktree> status --porcelain | wc -l          # 0 = nothing to lose
+git -C <polecat worktree> cherry origin/main HEAD | grep -c '^+'   # 0 = nothing unmerged
+bd show <bead-id>                                  # are findings already persisted?
+```
+
+- **Clean worktree + 0 commits ahead + a completion message in the pane = the work is
+  DONE, not lost.** Set the bead's status (`bd update <id> --status deferred`) — do not
+  reset, restart, re-sling, or nuke.
+- **An agent idling on an unsubmitted composer prompt is alive, not hung.**
+- **A polecat that deferred with reasons has done real work.** Read its notes before
+  proposing to discard them. Re-slinging a bead whose blocker is still open sends a
+  fresh polecat — without that analysis — to implement the very thing the last one
+  correctly refused to build.
+- Never report "no `gt done` executed" unless you checked the pane. `gt done` failing to
+  take effect is common; not running at all is rare.
+
+**Lifecycle actions are irreversible. A false positive costs real work; a false negative
+costs a few idle minutes.** When the evidence is ambiguous, prefer the reversible action
+and say what you could not determine.
+
+---
+
 ## 🔄 Context Management
 
 **Heuristic**: Hand off after **15 patrol loops** without major incident, OR
