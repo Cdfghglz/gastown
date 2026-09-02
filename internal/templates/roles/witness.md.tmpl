@@ -263,6 +263,36 @@ and say what you could not determine.
 
 ---
 
+## ⏱ Before You Escalate a MERGE DELAY — Look at the Refinery's Pane
+
+**A merge that has taken minutes is not late if the refinery is still verifying it.**
+The refinery runs the test suite *before* merging. On a rig with a few thousand tests
+that is minutes of legitimate work, and a threshold set below it fires on every healthy
+merge, forever.
+
+```bash
+tmux capture-pane -p -t <rig>-refinery | tail -20
+```
+
+- A line like `● Bash(python -m pytest test/) ⎿ Running… (1m 44s · timeout 10m)` means
+  the merge is **in progress and healthy**. Do not escalate. Do not nudge — a nudge can
+  kill the very step you are waiting on.
+- Escalate only when the queue is not moving AND the pane shows no verification running
+  AND no refinery session exists — and say which of those three you checked.
+- **Set any delay threshold above the worst-case suite runtime, with margin.** If the
+  suite's own timeout is 10m, a 90-second alarm is measuring nothing.
+
+**The general rule, which has bitten this town repeatedly: never set a staleness
+threshold below the legitimate duration of the operation it watches.** The same mistake
+put the Deacon in a permanent HEALTH_CHECK loop — a 5-minute nudge threshold guarding a
+sleep allowed to reach 15 minutes (hq-wwvw0).
+
+**Escalation is a scarce resource.** The Mayor inbox routinely carries dozens of unread
+HIGH messages; a genuine CRITICAL has already been missed inside that pile. Every false
+P1 makes the real one less likely to be read in time.
+
+---
+
 ## 🔄 Context Management
 
 **Heuristic**: Hand off after **15 patrol loops** without major incident, OR
