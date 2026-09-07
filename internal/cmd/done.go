@@ -1262,13 +1262,19 @@ notifyWitness:
 			// Remember the old branch so we can delete it after switching
 			oldBranch := branch
 
+			// ri-500s: sync to the branch's CONTENT with a detached HEAD, never by
+			// checking the branch out. A polecat worktree shares its gitdir with the
+			// refinery and every other polecat, so parking it on refs/heads/main made
+			// it hold a ref others advance; its files then stayed put under a moved
+			// HEAD and `git status` reported a staged REVERT of every commit since,
+			// with no author. Detached HEAD gives the same content and holds nothing.
 			fmt.Printf("%s Syncing worktree to %s...\n", style.Bold.Render("→"), defaultBranch)
-			if err := g.Checkout(defaultBranch); err != nil {
-				style.PrintWarning("could not checkout %s: %v (worktree stays on feature branch)", defaultBranch, err)
-			} else if err := g.Pull("origin", defaultBranch); err != nil {
-				style.PrintWarning("could not pull %s: %v (worktree on %s but may be stale)", defaultBranch, defaultBranch, err)
+			if err := g.Fetch("origin"); err != nil {
+				style.PrintWarning("could not fetch origin: %v (worktree stays on feature branch)", err)
+			} else if err := g.CheckoutDetached("origin/" + defaultBranch); err != nil {
+				style.PrintWarning("could not sync to %s: %v (worktree stays on feature branch)", defaultBranch, err)
 			} else {
-				fmt.Printf("%s Worktree synced to %s\n", style.Bold.Render("✓"), defaultBranch)
+				fmt.Printf("%s Worktree synced to %s (detached)\n", style.Bold.Render("✓"), defaultBranch)
 			}
 
 			// Delete the old polecat branch (non-fatal: cleanup only).
