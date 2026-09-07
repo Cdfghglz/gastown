@@ -136,6 +136,67 @@ func InjectFlatForListJSON(args []string) []string {
 	return args
 }
 
+// HasExplicitLimit reports whether args already carry a --limit/-n flag.
+// It recognizes every form cobra accepts for "-n, --limit int": "--limit 5",
+// "--limit=5", "-n 5", "-n=5", and the glued shorthand "-n5".
+func HasExplicitLimit(args []string) bool {
+	for _, a := range args {
+		if a == "--limit" || a == "-n" ||
+			strings.HasPrefix(a, "--limit=") || strings.HasPrefix(a, "-n=") {
+			return true
+		}
+		// Glued shorthand: -n5, -n0. Guard against "-name"-style long flags by
+		// requiring every character after -n to be a digit.
+		if strings.HasPrefix(a, "-n") && len(a) > 2 {
+			digits := true
+			for _, r := range a[2:] {
+				if r < '0' || r > '9' {
+					digits = false
+					break
+				}
+			}
+			if digits {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// InjectDefaultLimit adds --limit=0 (unlimited) to bd list commands that do not
+// request a limit of their own.
+//
+// WHY: bd's "-n, --limit int" defaults to 50. A `bd list` with no explicit limit
+// silently returns the first 50 rows -- no error, no warning, no truncation marker --
+// and the caller treats that page as the complete set. The town currently holds 102
+// agent beads, so this is not theoretical: it produced hq-p1jeb (14396bbc) and
+// ds-gxbr (d85e233a), which were fixed one at a time before anyone noticed they were
+// two instances of one class. See hq-is5vd.
+//
+// SCOPE -- only top-level "bd list" is touched, deliberately:
+//   - "bd mol wisp list" does NOT accept --limit. Passing it exits 1 with
+//     "unknown flag: --limit" and returns NO data, so blind-injecting there would
+//     convert a truncation risk into a hard zero-result failure in the daemon,
+//     mail router, doctor and ready paths.
+//   - Wisp listing is not at risk regardless: bd's runWispList caps at 5000, not 50.
+//
+// An explicit caller limit always wins, so intentionally-bounded queries (TUI pages,
+// "first N" probes) keep their own limit.
+func InjectDefaultLimit(args []string) []string {
+	if len(args) == 0 || args[0] != "list" {
+		return args
+	}
+	if HasExplicitLimit(args[1:]) {
+		return args
+	}
+	// Copy rather than append in place: callers share backing arrays with the
+	// other Inject* helpers, and appending to an aliased slice can clobber a
+	// neighbouring arg.
+	out := make([]string, len(args), len(args)+1)
+	copy(out, args)
+	return append(out, "--limit=0")
+}
+
 // ExtractIssueID strips the external:prefix:id wrapper from bead IDs.
 // bd dep add wraps cross-rig IDs as "external:prefix:id" for routing,
 // but consumers need the raw bead ID for display and lookups.
@@ -329,6 +390,17 @@ type Beads struct {
 	// for closing the store.
 	store beadsdk.Storage
 
+	// noRoute pins this client to beadsDir, suppressing the prefix-based
+	// re-routing that Show() otherwise applies.
+	//
+	// Needed for agent beads. They live in the TOWN database, but prefix
+	// routing sends an ID like "ns-navigation_server-polecat-dementus" to
+	// <town>/navigation_server/mayor/rig — the rig database, which holds no
+	// agent bead rows. Because Show() re-resolves routing itself, handing it a
+	// town-rooted client was not enough: it routed straight back to the rig and
+	// returned "issue not found". See agentBeadClient and hq-11042.
+	noRoute bool
+
 	// Lazy-cached town root for routing resolution.
 	// Populated on first call to getTownRoot() to avoid filesystem walk on every operation.
 	townRoot     string
@@ -421,6 +493,10 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 	// causing all JSON parsing to fail. Inject --flat before --allow-stale prepend
 	// (which changes args[0] from "list" to "--allow-stale").
 	args = InjectFlatForListJSON(args)
+
+	// bd list defaults to 50 rows and truncates silently. Default to unlimited
+	// unless the caller asked for a limit. See hq-is5vd.
+	args = InjectDefaultLimit(args)
 
 	// Conditionally use --allow-stale to prevent failures when db is temporarily stale
 	// (e.g., after daemon is killed during shutdown). Only if bd supports it.
@@ -1080,8 +1156,12 @@ func (b *Beads) ReadyWithType(issueType string) ([]*Issue, error) {
 func (b *Beads) Show(id string) (*Issue, error) {
 	// Route cross-rig queries via routes.jsonl so that rig-level bead IDs
 	// (e.g., "gt-abc123") resolve to the correct rig database.
+	//
+	// noRoute clients are already pinned to the right database and must not be
+	// re-routed — prefix routing would send agent bead IDs to a rig database
+	// that holds no agent beads (hq-11042).
 	targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
-	if targetDir != b.getResolvedBeadsDir() {
+	if !b.noRoute && targetDir != b.getResolvedBeadsDir() {
 		target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
 		return target.Show(id)
 	}

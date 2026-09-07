@@ -331,14 +331,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		}
 	}
 
-	// Parse branch info
+	// Parse branch info for the worker name. The issue is NOT taken from the
+	// branch here — see resolveSourceIssue below.
 	info := parseBranchName(branch)
-
-	// Override with explicit flags
-	issueID := doneIssue
-	if issueID == "" {
-		issueID = info.Issue
-	}
 	worker := info.Worker
 
 	// Determine polecat name from sender detection
@@ -346,6 +341,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	polecatName := ""
 	if parts := strings.Split(sender, "/"); len(parts) >= 2 {
 		polecatName = parts[len(parts)-1]
+	}
+
+	// Resolve the source issue: --issue > HOOKED bead > branch name.
+	// The hooked bead wins over the branch name because reused polecat branches
+	// carry the PREVIOUS assignment's name and mis-attribute the MR (hq-szhze).
+	issueID, err := resolveSourceIssue(beads.New(cwd), branch, doneIssue, sender)
+	if err != nil {
+		return err
 	}
 
 	// Get agent bead ID for cross-referencing
@@ -364,16 +367,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Sessions stay alive after gt done — polecat transitions to IDLE.
 	}
 
-	// If issue ID not set by flag or branch name, query for hooked beads
-	// assigned to this agent. This replaces reading agent_bead.hook_bead
-	// (hq-l6mm5: direct bead tracking instead of agent bead slot).
-	if issueID == "" && sender != "" {
-		bd := beads.New(cwd)
-		if hookIssue := findHookedBeadForAgent(bd, sender); hookIssue != "" {
-			issueID = hookIssue
-		}
-	}
-
 	// Write done-intent label EARLY, before push/MR operations.
 	// If gt done crashes after this point, the Witness can detect the intent
 	// and auto-nuke the zombie polecat.
@@ -384,7 +377,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	// skip those stages to avoid repeating work or hitting errors.
 	checkpoints := map[DoneCheckpoint]string{}
 	if agentBeadID != "" {
-		bd := beads.New(cwd)
+		bd := agentBeadClient(townRoot, cwd)
 		setDoneIntentLabel(bd, agentBeadID, exitType)
 		checkpoints = readDoneCheckpoints(bd, agentBeadID)
 		if len(checkpoints) > 0 {
@@ -760,7 +753,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 		// Write push checkpoint for resume (gt-aufru)
 		if agentBeadID != "" {
-			cpBd := beads.New(cwd)
+			cpBd := agentBeadClient(townRoot, cwd)
 			writeDoneCheckpoint(cpBd, agentBeadID, CheckpointPushed, branch)
 		}
 
@@ -1154,7 +1147,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 		// Write MR checkpoint for resume (gt-aufru)
 		if mrID != "" && agentBeadID != "" {
-			cpBd := beads.New(cwd)
+			cpBd := agentBeadClient(townRoot, cwd)
 			writeDoneCheckpoint(cpBd, agentBeadID, CheckpointMRCreated, mrID)
 		}
 
@@ -1189,7 +1182,7 @@ notifyWitness:
 	// longer processes routine completions from these fields.
 	fmt.Printf("\nNotifying Witness...\n")
 	if agentBeadID != "" {
-		completionBd := beads.New(cwd)
+		completionBd := agentBeadClient(townRoot, cwd)
 		meta := &beads.CompletionMetadata{
 			ExitType:       exitType,
 			MRID:           mrID,
@@ -1213,7 +1206,7 @@ notifyWitness:
 
 	// Write witness notification checkpoint for resume (gt-aufru)
 	if agentBeadID != "" {
-		cpBd := beads.New(cwd)
+		cpBd := agentBeadClient(townRoot, cwd)
 		writeDoneCheckpoint(cpBd, agentBeadID, CheckpointWitnessNotified, "ok")
 	}
 
@@ -1262,24 +1255,42 @@ notifyWitness:
 			// Remember the old branch so we can delete it after switching
 			oldBranch := branch
 
-			// ri-500s: sync to the branch's CONTENT with a detached HEAD, never by
-			// checking the branch out. A polecat worktree shares its gitdir with the
-			// refinery and every other polecat, so parking it on refs/heads/main made
-			// it hold a ref others advance; its files then stayed put under a moved
-			// HEAD and `git status` reported a staged REVERT of every commit since,
-			// with no author. Detached HEAD gives the same content and holds nothing.
-			fmt.Printf("%s Syncing worktree to %s...\n", style.Bold.Render("→"), defaultBranch)
-			if err := g.Fetch("origin"); err != nil {
-				style.PrintWarning("could not fetch origin: %v (worktree stays on feature branch)", err)
-			} else if err := g.CheckoutDetached("origin/" + defaultBranch); err != nil {
-				style.PrintWarning("could not sync to %s: %v (worktree stays on feature branch)", defaultBranch, err)
+			// Sync the worktree to the default branch's CONTENT with a DETACHED
+			// HEAD, never by checking the branch out (ri-500s / hq-szhze).
+			//
+			// Polecat sandboxes are linked worktrees of the rig's bare repo, and
+			// the refinery worktree (<rig>/refinery/rig) holds <defaultBranch>
+			// checked out permanently. So `git checkout main` here fails with
+			// "'main' is already checked out at <rig>/refinery/rig", which left
+			// the worktree stuck on the feature branch AND skipped the branch
+			// deletion below; the next assignment then committed onto a stale
+			// branch whose name mis-attributed the MR.
+			//
+			// Worse, when it did succeed it made this worktree hold refs/heads/main
+			// -- a ref every other worktree in the gitdir shares. When one of them
+			// advanced main, the others kept their old files under a moved HEAD and
+			// `git status` rendered the difference as a staged REVERT with no
+			// author, which anyone "preserving" the work would re-land.
+			//
+			// Detaching takes main's content without claiming the ref, so it
+			// neither contends nor holds anything.
+			fmt.Printf("%s Syncing worktree to origin/%s...\n", style.Bold.Render("→"), defaultBranch)
+			syncErr := g.Fetch("origin")
+			if syncErr != nil {
+				style.PrintWarning("could not fetch origin: %v (syncing to possibly stale refs)", syncErr)
+			}
+			syncErr = g.CheckoutDetached("origin/" + defaultBranch)
+			if syncErr != nil {
+				style.PrintWarning("could not sync worktree to origin/%s: %v (worktree stays on feature branch)", defaultBranch, syncErr)
 			} else {
-				fmt.Printf("%s Worktree synced to %s (detached)\n", style.Bold.Render("✓"), defaultBranch)
+				fmt.Printf("%s Worktree synced to origin/%s (detached)\n", style.Bold.Render("✓"), defaultBranch)
 			}
 
 			// Delete the old polecat branch (non-fatal: cleanup only).
 			// This prevents stale branch accumulation from persistent polecats.
-			if oldBranch != "" && oldBranch != defaultBranch && oldBranch != "master" {
+			// Only safe once the sync moved HEAD off that branch — git refuses
+			// to delete the branch that is currently checked out.
+			if syncErr == nil && oldBranch != "" && oldBranch != defaultBranch && oldBranch != "master" {
 				if err := g.DeleteBranch(oldBranch, true); err != nil {
 					style.PrintWarning("could not delete old branch %s: %v", oldBranch, err)
 				} else {
@@ -1354,6 +1365,28 @@ func pushSubmoduleChanges(g *git.Git, defaultBranch string) {
 //
 // Follows the existing idle:N / backoff-until:TIMESTAMP label pattern.
 // Non-fatal: if this fails, gt done continues without the safety net.
+// agentBeadClient returns a beads client that can actually reach agent beads.
+//
+// CreateAgentBead (beads_agent.go:224-228) redirects ANY prefixed agent bead ID
+// to the town beads dir, so agent beads physically live in the town database.
+// A client built from cwd — which for gt done is the polecat's clone — resolves
+// to the RIG database instead, and Beads.Update (beads.go:1430) does not route:
+// it runs `bd update <id>` wherever the client points. bd's own prefix router
+// does not rescue it either, because routes.jsonl maps e.g. "ns-" to
+// <rig>/mayor/rig, whose metadata.json names the rig database — the very
+// database that holds no agent bead rows.
+//
+// The result was that every gt done cleanup write ("issue not found") failed
+// while gt done still exited 0: work completed, hook never cleared, bead hung.
+// navigation_server had ZERO agent bead rows locally, which is why it could not
+// land anything at all. See hq-11042.
+func agentBeadClient(townRoot, cwd string) *beads.Beads {
+	if townRoot == "" {
+		return beads.New(cwd)
+	}
+	return beads.NewWithBeadsDir(townRoot, beads.GetTownBeadsPath(townRoot))
+}
+
 func setDoneIntentLabel(bd *beads.Beads, agentBeadID, exitType string) {
 	if agentBeadID == "" {
 		return
@@ -1662,23 +1695,15 @@ doneStateUpdate:
 	clearDoneCheckpoints(bd, agentBeadID)
 }
 
-// findHookedBeadForAgent queries for beads with status=hooked assigned to this agent.
-// This is the authoritative source for what work a polecat is doing, since the
-// work bead itself tracks status and assignee (hq-l6mm5).
-// Returns empty string if no hooked bead is found.
+// findHookedBeadForAgent returns the first bead with status=hooked assigned to
+// this agent, or "" if there is none. See findHookedBeadsForAgent, and prefer
+// resolveSourceIssue when the answer will label an MR.
 func findHookedBeadForAgent(bd *beads.Beads, agentID string) string {
-	if agentID == "" {
+	hooked := findHookedBeadsForAgent(bd, agentID)
+	if len(hooked) == 0 {
 		return ""
 	}
-	hookedBeads, err := bd.List(beads.ListOptions{
-		Status:   beads.StatusHooked,
-		Assignee: agentID,
-		Priority: -1,
-	})
-	if err != nil || len(hookedBeads) == 0 {
-		return ""
-	}
-	return hookedBeads[0].ID
+	return hooked[0]
 }
 
 // parseCleanupStatus converts a string flag value to a CleanupStatus.

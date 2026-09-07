@@ -490,13 +490,23 @@ func (g *Git) Checkout(ref string) error {
 }
 
 // CheckoutDetached checks out the given ref with a detached HEAD.
+// Equivalent to: git checkout --detach <ref>
 //
-// ri-500s: prefer this over Checkout(branch) for any worktree that only needs
-// the CONTENT of a branch, not ownership of the ref. A worktree that holds
-// refs/heads/main shares it with every other worktree in the same gitdir --
-// the refinery and every polecat -- so when one of them advances main the
-// others keep their old files under a moved HEAD, and `git status` renders the
-// difference as a staged REVERT with no author.
+// ri-500s / hq-szhze: prefer this over Checkout(branch) for any worktree that
+// only needs the CONTENT of a branch, not ownership of the ref. Every polecat,
+// crew, and refinery workspace in a rig is a linked worktree of one bare repo,
+// which causes two distinct failures:
+//
+//   - Git refuses to check out a branch another linked worktree already holds
+//     ("already checked out at ..."). The refinery worktree holds the default
+//     branch permanently, so Checkout(main) simply fails there.
+//   - When it does succeed, the worktree holds refs/heads/main -- a ref every
+//     other worktree shares. When one of them advances main, the others keep
+//     their old files under a moved HEAD and `git status` renders the
+//     difference as a staged REVERT with no author.
+//
+// Detaching takes the content without claiming the ref, so it neither contends
+// nor holds anything.
 func (g *Git) CheckoutDetached(ref string) error {
 	_, err := g.run("checkout", "--detach", ref)
 	return err
