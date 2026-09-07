@@ -40,7 +40,7 @@ require (
 // skips the SHOW DATABASES catalog probe + 2nd pool on non-creating opens and
 // guards no-op DOLT_COMMITs — cutting per-open Dolt connection churn. Mirrors
 // the deployed `bd` binary (also built from /home/cdf/ws/beads-patched).
-replace github.com/steveyegge/beads => /home/cdf/ws/beads-patched
+replace github.com/steveyegge/beads => /home/pr_admin/ws/beads-patched
 
 require (
 	cel.dev/expr v0.25.1 // indirect

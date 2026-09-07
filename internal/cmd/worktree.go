@@ -151,11 +151,27 @@ func runWorktree(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s Warning: could not fetch from origin: %v\n", style.Warning.Render("⚠"), err)
 	}
 
-	// Create the worktree on main branch
-	// Use WorktreeAddExistingForce because main may already be checked out
-	// in other worktrees (e.g., mayor/rig). This is safe for cross-rig work.
-	if err := g.WorktreeAddExistingForce(worktreePath, "main"); err != nil {
-		return fmt.Errorf("creating worktree: %w", err)
+	// Create the worktree on its OWN branch, never on main.
+	//
+	// ri-500s: this used to be WorktreeAddExistingForce(worktreePath, "main"),
+	// i.e. `git worktree add --force`, which bypasses git's refusal to check the
+	// same branch out twice in one gitdir. Every crew worktree then shared
+	// refs/heads/main with that rig's mayor/rig clone. A commit in any one of
+	// them advances main for ALL of them, while the others' index and working
+	// tree stay at the old content -- so `git status` renders the difference as
+	// a STAGED REVERT of every commit since, with no author. Observed as 1960
+	// phantom deletions in navigation_server/mayor/rig; it cost a sim window and
+	// produced a stash that would have re-landed a revert of a whole epic.
+	//
+	// Each crew worktree gets crew/<source-rig>-<name> branched from origin/main
+	// instead. mayor/rig alone owns main.
+	crewBranch := fmt.Sprintf("crew/%s-%s", sourceRig, crewName)
+	if err := g.WorktreeAddFromRef(worktreePath, crewBranch, "origin/main"); err != nil {
+		// The branch already exists (a previous worktree at this path was removed
+		// but the branch outlived it) -- reuse it rather than forcing onto main.
+		if errExisting := g.WorktreeAddExisting(worktreePath, crewBranch); errExisting != nil {
+			return fmt.Errorf("creating worktree on branch %s: %w", crewBranch, err)
+		}
 	}
 
 	// Configure git author for identity preservation
@@ -170,7 +186,7 @@ func runWorktree(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Created worktree for cross-rig work\n", style.Success.Render("✓"))
 	fmt.Printf("  Source: %s/crew/%s\n", sourceRig, crewName)
 	fmt.Printf("  Target: %s\n", worktreePath)
-	fmt.Printf("  Branch: main\n")
+	fmt.Printf("  Branch: %s\n", crewBranch)
 	fmt.Println()
 
 	// Pull latest main in the new worktree
